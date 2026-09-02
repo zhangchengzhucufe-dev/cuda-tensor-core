@@ -1,0 +1,19 @@
+name: build
+
+# compile-only: github runners have no GPU, so this just makes sure every
+# kernel still builds on a clean toolchain. correctness/perf numbers are all
+# from my local card (see README).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates make g++
+      - uses: actions/checkout@v4
+      - name: build everything
+        run: make ARCH=sm_86 -j$(nproc)
