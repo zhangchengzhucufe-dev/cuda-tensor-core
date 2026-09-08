@@ -15,5 +15,7 @@ jobs:
     steps:
       - run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates make g++
       - uses: actions/checkout@v4
+      - name: fetch cutlass (sgemm_cutlass needs it, Makefile skips that target without it)
+        run: git clone --depth 1 -b v4.8.0 https://github.com/NVIDIA/cutlass "$HOME/cutlass"
       - name: build everything
         run: make ARCH=sm_86 -j$(nproc)
