@@ -7,19 +7,17 @@ I read out of it.
 ## What works where (WSL2)
 
 - `nsys` works: kernel timelines, API call costs, memcpy traffic. Used below.
-- `ncu` does **not** work here: hardware performance counters are blocked
-  by the driver, every profile dies with
+- `ncu`: when these notes were first written, hardware performance counters
+  were blocked on this machine (`ERR_NVGPUCTRPERM` on every profile). Some
+  time between then and 2026-09-13 that stopped being true -- driver update
+  on the Windows side or the counter-access setting flipping -- and `ncu
+  --set full` now works, permissions and all. The counter-level analysis
+  that used to live in "commands I'd run someday" is now real; the full
+  GEMM ladder is done in [gemm_deep_dive.md](gemm_deep_dive.md).
 
-  ```
-  ==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access
-  NVIDIA GPU Performance Counters on the target device 0.
-  ```
-
-  On native Linux the fix is the `NVreg_RestrictProfilingToAdminUsers=0`
-  module option; in WSL2 there's no equivalent, counters are simply off.
-  So all counter-level analysis (occupancy, bank conflicts, roofline) has
-  to happen on a real Linux box or the DCA cluster. Commands I'd run there
-  are at the bottom.
+  Lesson I'm keeping either way: "this profiler doesn't work here" is a
+  dated observation, not a fact about the machine. Re-check the premise
+  when you come back to it.
 
 ## GEMM: where the time actually goes
 
@@ -81,27 +79,44 @@ transfers serialize on a single copy engine, which is the hardware reason
 the multi-stream example only buys ~1.03x on this card. On an A100/H100
 with multiple engines the same code overlaps properly.
 
-## What I'd run on a counter-enabled box
+## The counter-level follow-ups, now that they run
+
+**GEMM ladder, full `--set full` treatment** (naive / tiled /
+register-tile / double-buffer / CUTLASS / cuBLAS at a uniform 2048^3):
+see [gemm_deep_dive.md](gemm_deep_dive.md). The one-line summary: naive
+is LSU-issue-bound (`lg_throttle` 23.4 cycles/issue, DRAM only 52%),
+register tiling moves the bottleneck to the FMA pipe at a self-inflicted
+33% occupancy (128 regs/thread -> 2 blocks/SM), cp.async buys +15% on
+top, CUTLASS's stock SIMT config hits 67% of FP32 peak and beats
+cuBLAS by 11% on this card.
+
+**Transpose bank conflicts** -- the `[TILE][TILE+1]` pad, verified:
 
 ```
-# occupancy + register pressure on the GEMM ladder kernels
-ncu --set full --kernel-name regex:sgemm ./build/08_gemm_opt/sgemm_register_tile
-
-# the two questions worth answering for the register-tile kernel:
-#   1. launch__registers_per_thread -> why 6 blocks/SM and not more
-#   2. sm__pipe_tensor / sm__throughput -> how close to issue-bound
-
-# bank conflicts on the transpose / reduction kernels
-ncu --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum \
+$ ncu --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
     ./build/02_memory/transpose_tiled
-
-# roofline position of the bandwidth-bound kernels
-ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
-gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed \
-    ./build/01_basics/vector_add
+  op_ld.sum   95141     (tiled kernel)
+  op_st.sum   62295     (tiled kernel)
 ```
 
-Expected (from the literature, to be confirmed): register-tile GEMM sits
-at ~128 regs/thread -> 6 blocks/SM on sm_86; vector_add should show
-memory throughput near peak and SM throughput in single digits, the
-signature of a bandwidth-bound kernel.
+95k + 62k conflicts looks scary until you divide: n=4096 means 16384
+blocks x 32 warps x 64 shared accesses = 33.5M wavefronts, so ~0.47%
+conflict rate -- the pad killed them, and the residue is the edge
+blocks where tiles run off the matrix. The naive kernel in the same
+binary shows 0/0 because it never touches shared memory at all.
+
+**vector_add, the bandwidth-bound signature**:
+
+```
+$ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed ./build/01_basics/vector_add
+  dram__throughput...            %   93.96
+  gpu__compute_memory_throughput %   93.96
+  sm__throughput...              %   15.21
+```
+
+DRAM pinned at 94% of peak while the SMs loaf at 15% -- the exact shape
+a bandwidth-bound kernel is supposed to have. The README's bandwidth
+math now has the counters to back it.
